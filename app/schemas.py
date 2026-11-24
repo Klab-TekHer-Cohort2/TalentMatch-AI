@@ -46,6 +46,15 @@ class ResendVerificationRequest(BaseModel):
     email: EmailStr
 
 
+class RequestEmailOtpRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyEmailOtpRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
 class UserPublic(ORMModel):
     id: int
     full_name: str
@@ -59,6 +68,12 @@ class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserPublic
+
+
+class VerificationRequiredOut(BaseModel):
+    message: str
+    email: EmailStr
+    requires_verification: bool = True
 
 
 # ---------- Seeker profile ----------

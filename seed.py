@@ -6,7 +6,7 @@ Usage:
 """
 
 import argparse
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import select
 
@@ -777,12 +777,17 @@ SEEKERS = [
 def _user(db, email: str, full_name: str, role: UserRole) -> User:
     existing = db.scalar(select(User).where(User.email == email))
     if existing:
+        if not existing.email_verified:
+            existing.email_verified = True
+            existing.email_verified_at = datetime.now(timezone.utc)
         return existing
     user = User(
         full_name=full_name,
         email=email,
         hashed_password=hash_password(DEMO_PASSWORD),
         role=role,
+        email_verified=True,
+        email_verified_at=datetime.now(timezone.utc),
     )
     db.add(user)
     db.flush()

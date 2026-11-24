@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 60 * 24
     reset_token_expire_minutes: int = 60
     email_verification_expire_minutes: int = 24 * 60
+    otp_expire_minutes: int = 10
+    otp_max_attempts: int = 5
+    otp_resend_cooldown_seconds: int = 60
 
     database_url: str = "sqlite:///./talentmatch.db"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"

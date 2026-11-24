@@ -18,11 +18,15 @@ os.environ["CHROMA_DIR"] = str(TEMP_ROOT / "chroma")
 os.environ["EMBEDDING_BACKEND"] = "hashing"
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["CORS_ORIGINS"] = "http://localhost:5173"
+os.environ["SMTP_HOST"] = ""
+os.environ["SMTP_FROM_EMAIL"] = ""
 
 from fastapi.testclient import TestClient  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 from app.database import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
+from app.models import User  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -56,6 +60,10 @@ def register_user(client):
         payload.update(overrides)
         response = client.post("/auth/register", json=payload)
         assert response.status_code == 201, response.text
+        with SessionLocal() as session:
+            user = session.scalar(select(User).where(User.email == email))
+            user.email_verified = True
+            session.commit()
         return {**response.json(), "email": email, "password": "Password123!"}
 
     return _register

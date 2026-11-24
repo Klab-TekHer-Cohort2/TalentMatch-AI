@@ -160,7 +160,7 @@ def upload_cv(
     for old in previous:
         remove_file(old.file_path)
 
-    key_points = analysis.get("key_points") or []
+    key_points = structured.get("key_points") or []
     if not key_points:
         from ..services.ai import derive_key_points
 
@@ -260,6 +260,14 @@ def apply_to_job(
     db: Session = Depends(get_db),
 ) -> ApplicationOut:
     profile = _profile(user)
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "EMAIL_NOT_VERIFIED",
+                "message": "Verify your email address before applying to a job.",
+            },
+        )
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")

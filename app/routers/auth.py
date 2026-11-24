@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from ..config import settings
 from ..database import get_db
 from ..deps import get_current_user
 from ..models import (
+    EmailOtp,
     EmailVerificationToken,
     EmployerProfile,
     JobSeekerProfile,
@@ -24,14 +26,18 @@ from ..schemas import (
     LoginRequest,
     MessageOut,
     RegisterRequest,
+    RequestEmailOtpRequest,
     ResendVerificationRequest,
     ResetPasswordRequest,
     TokenResponse,
+    VerificationRequiredOut,
+    VerifyEmailOtpRequest,
     VerifyEmailRequest,
     UserPublic,
 )
 from ..security import create_access_token, hash_password, verify_password
 from ..services.email import (
+    send_email_otp,
     send_email_verification,
     send_password_reset_email,
     smtp_configured,
@@ -47,8 +53,14 @@ def _token_response(user: User) -> TokenResponse:
     return TokenResponse(access_token=token, user=UserPublic.model_validate(user))
 
 
-@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
-def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> TokenResponse:
+@router.post(
+    "/register",
+    response_model=TokenResponse | VerificationRequiredOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def register(
+    payload: RegisterRequest, db: Session = Depends(get_db)
+) -> TokenResponse | VerificationRequiredOut:
     email = payload.email.lower().strip()
     exists = db.scalar(select(User).where(func.lower(User.email) == email))
     if exists:
@@ -79,10 +91,16 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> TokenRe
     if smtp_configured():
         try:
             raw_token = _create_email_verification_token(db, user)
+            otp_code = _create_email_otp(db, user)
             verification_url = f"{settings.frontend_url.rstrip('/')}/verify-email?token={raw_token}"
-            send_email_verification(user.email, verification_url)
+            send_email_verification(user.email, verification_url, otp_code)
         except Exception as exc:
             logger.exception("Failed to send registration verification email: %s", exc)
+            _invalidate_active_otps(db, user)
+        return VerificationRequiredOut(
+            message="We sent a 6-digit verification code to your email. Enter it to activate your account.",
+            email=user.email,
+        )
 
     return _token_response(user)
 
@@ -98,6 +116,14 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
         )
     if not user.is_active:
         raise HTTPException(status_code=403, detail="This account is disabled")
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "EMAIL_NOT_VERIFIED",
+                "message": "Verify your email address with the code we sent you before logging in.",
+            },
+        )
     return _token_response(user)
 
 
@@ -127,6 +153,47 @@ def change_password(
 
 def _hash_reset_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _hash_otp(code: str) -> str:
+    return hmac.new(
+        settings.secret_key.encode("utf-8"), code.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _invalidate_active_otps(db: Session, user: User) -> None:
+    now = datetime.now(timezone.utc)
+    active = db.scalars(
+        select(EmailOtp).where(
+            EmailOtp.user_id == user.id,
+            EmailOtp.used_at.is_(None),
+            EmailOtp.expires_at > now,
+        )
+    ).all()
+    for record in active:
+        record.used_at = now
+    db.commit()
+
+
+def _create_email_otp(db: Session, user: User) -> str:
+    _invalidate_active_otps(db, user)
+    now = datetime.now(timezone.utc)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    db.add(
+        EmailOtp(
+            user_id=user.id,
+            code_hash=_hash_otp(code),
+            expires_at=now + timedelta(minutes=settings.otp_expire_minutes),
+        )
+    )
+    db.commit()
+    return code
 
 
 def _create_email_verification_token(db: Session, user: User) -> str:
@@ -178,6 +245,96 @@ def verify_email(payload: VerifyEmailRequest, db: Session = Depends(get_db)) -> 
     user.email_verified = True
     user.email_verified_at = now
     record.used_at = now
+    db.add(user)
+    db.add(record)
+    db.commit()
+    return MessageOut(message="Email verified successfully")
+
+
+@router.post("/request-email-otp", response_model=MessageOut)
+def request_email_otp(
+    payload: RequestEmailOtpRequest,
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    generic = MessageOut(message="If an unverified account exists, a verification code has been sent.")
+    email = payload.email.lower().strip()
+    user = db.scalar(select(User).where(func.lower(User.email) == email))
+    if user is None or not user.is_active or user.email_verified:
+        return generic
+    if not smtp_configured():
+        raise HTTPException(status_code=503, detail="Email delivery is not configured.")
+
+    now = datetime.now(timezone.utc)
+    last = db.scalar(
+        select(EmailOtp)
+        .where(
+            EmailOtp.user_id == user.id,
+            EmailOtp.used_at.is_(None),
+            EmailOtp.expires_at > now,
+        )
+        .order_by(EmailOtp.created_at.desc())
+    )
+    last_created = _as_utc(last.created_at) if last else None
+    if last_created is not None and (now - last_created) < timedelta(
+        seconds=settings.otp_resend_cooldown_seconds
+    ):
+        raise HTTPException(status_code=429, detail="Please wait before requesting another code.")
+
+    code = _create_email_otp(db, user)
+    try:
+        send_email_otp(user.email, code)
+    except Exception as exc:
+        logger.exception("Failed to send verification code: %s", exc)
+        raise HTTPException(status_code=503, detail="Could not send the verification code. Please try again later.") from exc
+    return generic
+
+
+@router.post("/verify-email-otp", response_model=MessageOut)
+def verify_email_otp(
+    payload: VerifyEmailOtpRequest,
+    db: Session = Depends(get_db),
+) -> MessageOut:
+    email = payload.email.lower().strip()
+    user = db.scalar(select(User).where(func.lower(User.email) == email))
+    code_hash = _hash_otp(payload.code.strip())
+    record = None
+    if user is not None:
+        record = db.scalar(
+            select(EmailOtp)
+            .where(EmailOtp.user_id == user.id, EmailOtp.code_hash == code_hash)
+            .order_by(EmailOtp.created_at.desc())
+        )
+
+    now = datetime.now(timezone.utc)
+    expires_at = _as_utc(record.expires_at) if record else None
+    if (
+        record is None
+        or record.used_at is not None
+        or expires_at is None
+        or expires_at <= now
+        or record.attempts >= settings.otp_max_attempts
+    ):
+        if record is not None and record.used_at is None and expires_at is not None and expires_at > now:
+            record.attempts += 1
+            if record.attempts >= settings.otp_max_attempts:
+                record.used_at = now
+            db.add(record)
+            db.commit()
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code")
+
+    record.used_at = now
+    active = db.scalars(
+        select(EmailOtp).where(
+            EmailOtp.user_id == user.id,
+            EmailOtp.used_at.is_(None),
+            EmailOtp.expires_at > now,
+        )
+    ).all()
+    for other in active:
+        other.used_at = now
+    user.email_verified = True
+    if user.email_verified_at is None:
+        user.email_verified_at = now
     db.add(user)
     db.add(record)
     db.commit()
